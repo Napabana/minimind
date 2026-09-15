@@ -335,13 +335,13 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
             per_token_loss = -(torch.min(per_token_loss1, per_token_loss2) - args.beta * per_token_kl)
         policy_loss = (((per_token_loss * completion_mask).sum(dim=1)[valid_rows] / token_counts[valid_rows].clamp(min=1)).mean()
                        if valid_rows.any() else per_token_loss.sum() * 0.0)
-        loss = (policy_loss + aux_loss) / args.accumulation_steps
+        loss = (policy_loss + aux_loss) / args.accumulation_steps #每个batch先loss=loss/8，最终累计grad
         loss.backward()
 
         if step % args.accumulation_steps == 0:
             if args.grad_clip > 0: torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step(); scheduler.step(); optimizer.zero_grad()
-
+        
         if step % args.log_interval == 0 or step == iters:
             pl = loss.item() * args.accumulation_steps
             ar = rewards.mean().item()

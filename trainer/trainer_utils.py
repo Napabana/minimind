@@ -16,6 +16,7 @@ from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassific
 from model.model_minimind import MiniMindForCausalLM
 
 def get_model_params(model, config):
+    """统计模型总参数量，以及 MoE 模型每个 token 实际激活的参数量。"""
     total = sum(p.numel() for p in model.parameters()) / 1e6
     n_routed = getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0))
     n_active = getattr(config, 'num_experts_per_tok', 0)
@@ -29,19 +30,23 @@ def get_model_params(model, config):
 
 
 def is_main_process():
+    """判断当前进程是否为主进程，用于避免 DDP 多进程重复输出或保存。"""
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
 def Logger(content):
+    """只在主进程打印训练日志。"""
     if is_main_process():
         print(content)
 
 
 def get_lr(current_step, total_steps, lr):
+    """按照余弦退火策略计算当前训练步的学习率。"""
     return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
 
 
 def init_distributed_mode():
+    """初始化单卡或多卡 DDP 环境，并返回当前进程使用的本地 GPU 编号。"""
     if int(os.environ.get("RANK", -1)) == -1:
         return 0  # 非DDP模式
 
@@ -52,6 +57,7 @@ def init_distributed_mode():
 
 
 def setup_seed(seed: int):
+    """固定 Python、NumPy 和 PyTorch 的随机种子，尽量保证训练可复现。"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -61,6 +67,7 @@ def setup_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
+    """保存或恢复模型、优化器、混合精度 Scaler、训练进度和 wandb 信息。"""
     os.makedirs(save_dir, exist_ok=True)
     moe_path = '_moe' if lm_config.use_moe else ''
     ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
@@ -107,6 +114,7 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
     else:  # 加载模式
         if os.path.exists(resume_path):
             ckp_data = torch.load(resume_path, map_location='cpu')
+            #world_size 就是训练时用了多少个进程 / GPU。
             saved_ws = ckp_data.get('world_size', 1)
             current_ws = dist.get_world_size() if dist.is_initialized() else 1
             if saved_ws != current_ws:
@@ -115,7 +123,7 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
             return ckp_data
         return None
 
-
+# 创建一个随机初始化的 MiniMind→ 移到 CPU/GPU→ 返回 model 和 tokenizer
 def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     model = MiniMindForCausalLM(lm_config)
@@ -130,8 +138,9 @@ def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', sav
     Logger(f'Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M')
     return model.to(device), tokenizer
 
-
+#凑满batch 然后丢掉
 class SkipBatchSampler(Sampler):
+    """断点续训时跳过已经训练过的 batch，并生成剩余 batch。"""
     def __init__(self, sampler, batch_size, skip_batches=0):
         self.sampler = sampler
         self.batch_size = batch_size
@@ -151,13 +160,14 @@ class SkipBatchSampler(Sampler):
                 batch = []
         if len(batch) > 0 and skipped >= self.skip_batches:
             yield batch
-
+    #向上取整 返回恢复后 loader 还剩多少个 batch
     def __len__(self):
         total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
         return max(0, total_batches - self.skip_batches)
 
 
 class LMForRewardModel:
+    """加载奖励模型并为强化学习阶段的回复计算奖励分数。"""
     def __init__(self, model_path, device="cuda", dtype=torch.float16):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.model = AutoModel.from_pretrained(model_path, torch_dtype=dtype, trust_remote_code=True)

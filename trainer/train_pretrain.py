@@ -22,6 +22,7 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    """执行一个预训练 epoch：前向计算、反向传播、梯度累积、参数更新和定期保存。"""
     start_time = time.time()
     last_step = start_step
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
@@ -32,22 +33,28 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
+        # autocast 的作用是：让适合低精度计算的算子自动用 bfloat16/float16，而需要更高数值稳定性的部分由 PyTorch 自动选择更合适的精度。目的主要是减少显存占用并提高 GPU 计算效率。
         with autocast_ctx:
             res = model(input_ids, labels=labels)
             loss = res.loss + res.aux_loss
-            loss = loss / args.accumulation_steps
+            loss = loss / args.accumulation_steps #累加8个batch更新一次
 
+        #GPU + BF16（默认）→ autocast 做混合精度前向→ 不启用 GradScaler
+        # GPU + FP16     → autocast 做混合精度前向→ 同时启用 GradScaler
+        # GradScaler 主要管 FP16 反向传播时的梯度数值稳定性。在 FP16 训练时放大 loss，避免小梯度数值下溢。
         scaler.scale(loss).backward()
 
         if step % args.accumulation_steps == 0:
+            #先方法再裁剪
             scaler.unscale_(optimizer)
+            #限制所有参数梯度合起来的整体 norm  参数更新前防止梯度整体过大
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             scaler.step(optimizer)
             scaler.update()
-
+            #把 grad 设成 None
             optimizer.zero_grad(set_to_none=True)
-
+        #写日志
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
@@ -72,6 +79,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         del input_ids, labels, res, loss
 
+    #没凑满 accumulation_steps 的梯度 手动处理
     if last_step > start_step and last_step % args.accumulation_steps != 0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -81,6 +89,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
 
 if __name__ == "__main__":
+    # 预训练入口：解析参数，初始化环境和模型，加载数据集，并启动训练循环。
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
@@ -100,29 +109,33 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--seed', default=42, type=int, help="随机种子（DDP下每个rank为seed+rank，每轮为seed+epoch）")
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_t2t_mini.jsonl", help="预训练数据路径")
-    parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
-    parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
+    parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始") #拿已有模型参数作为训练起点
+    parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）") #上次挂了，恢复训练
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
+    # 初始化 GPU、单卡或多卡 DDP，并设置随机种子。
     local_rank = init_distributed_mode()
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
     setup_seed(args.seed + (dist.get_rank() if dist.is_initialized() else 0))
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
+    # 创建输出目录，构造模型配置，并检查是否存在可恢复的训练断点。
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
+    # 配置 CPU/GPU 的计算类型，以及 BF16 或 FP16 自动混合精度。
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     
     # ========== 4. 配wandb ==========
+    # 初始化可选的实验记录工具，并在恢复训练时续接原有记录。
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
@@ -132,13 +145,16 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========
+    # 创建模型和预训练数据集，并使用 AdamW 初始化优化器。
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    # 默认 ../dataset/pretrain_t2t_mini.jsonl   len=340  size=32
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
     # ========== 6. 从ckp恢复状态 ==========
+    # 恢复模型、优化器、Scaler、epoch 和 step，支持中断后继续训练。
     start_epoch, start_step = 0, 0
     if ckp_data:
         model.load_state_dict(ckp_data['model'])
@@ -148,6 +164,7 @@ if __name__ == "__main__":
         start_step = ckp_data.get('step', 0)
     
     # ========== 7. 编译和分布式包装 ==========
+    # 按需启用 torch.compile，并在多卡环境下用 DDP 包装模型。
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
@@ -155,9 +172,14 @@ if __name__ == "__main__":
         model = DistributedDataParallel(model, device_ids=[local_rank])
     
     # ========== 8. 开始训练 ==========
+    # 按 epoch 打乱数据，跳过已完成的 batch，然后执行预训练循环。
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
-        setup_seed(args.seed + epoch); indices = torch.randperm(len(train_ds)).tolist()
+        setup_seed(args.seed + epoch); 
+        #randperm 把样本索引随机打乱
+        indices = torch.randperm(len(train_ds)).tolist()
+        #skip用于断电续训
+        #SkipBatchSampler 再按 batch_size 分组
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
@@ -168,6 +190,7 @@ if __name__ == "__main__":
             train_epoch(epoch, loader, len(loader), 0, wandb)
     
     # ========== 9. 清理分布进程 ==========
+    # 等待所有进程完成并销毁 DDP 进程组。
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()

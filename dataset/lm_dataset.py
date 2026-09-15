@@ -35,10 +35,12 @@ def post_processing_chat(prompt_content, empty_think_ratio=0.2):
     return prompt_content
 
 class PretrainDataset(Dataset):
+    #路径，分词器，每条样本最终固定长度
     def __init__(self, data_path, tokenizer, max_length=512):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
+        #self.samples 中每条数据至少需要有： {"text": "一段预训练文本"}
         self.samples = load_dataset('json', data_files=data_path, split='train')
 
     def __len__(self):
@@ -47,12 +49,16 @@ class PretrainDataset(Dataset):
     def __getitem__(self, index):
         sample = self.samples[index]
         tokens = self.tokenizer(str(sample['text']), add_special_tokens=False, max_length=self.max_length - 2, truncation=True).input_ids
+        #手动添加BOS 和 EOS
         tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
+        #补齐pad到max_length
         input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
+        #转换成整数张量
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         labels = input_ids.clone()
-        labels[input_ids == self.tokenizer.pad_token_id] = -100
+        labels[input_ids == self.tokenizer.pad_token_id] = -100#错位在模型中完成
         return input_ids, labels
+
 
 
 class SFTDataset(Dataset):
