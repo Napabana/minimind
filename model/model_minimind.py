@@ -317,7 +317,6 @@ class MiniMindModel(nn.Module):
         #词元嵌入层：6400 个 token ID → 每个 token 变成 768 维向量
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        Dropout
         self.dropout = nn.Dropout(config.dropout)
         #默认8个MiniMindBlock
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
