@@ -68,11 +68,18 @@ class TorchRolloutEngine(RolloutEngine):
         self.device = device
         self.autocast_ctx = autocast_ctx
     
+    #    当前训练进程中的 policy model                                                              
+    #        │                                                                                  
+    #        ├── generate 生成 completion                                                       
+    #        └── 再计算 completion 的 log probability  
     def rollout(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8) -> RolloutResult:
         model = self.policy_model.module if isinstance(self.policy_model, DistributedDataParallel) else self.policy_model
         ctx = self.autocast_ctx if self.autocast_ctx else nullcontext()
         with torch.no_grad(), ctx:
+            #直接调用当前 Python 进程中的 MiniMind 模型生成文本
+            #output_ids:Prompt + Completion [batch_size*num_generations,promp+completion]
             output_ids = model.generate(
+                #复制提示词，因为一个提示词需要生成多个样本
                 input_ids=prompt_ids.repeat_interleave(num_generations, dim=0),
                 attention_mask=attention_mask.repeat_interleave(num_generations, dim=0),
                 max_new_tokens=max_new_tokens,
@@ -83,9 +90,12 @@ class TorchRolloutEngine(RolloutEngine):
                 eos_token_id=self.tokenizer.eos_token_id,
             ).clone()  # [B*num_gen, P+R]
             prompt_len = prompt_ids.size(1)
+            #生成部分的 Token，取出回答的部分
             completion_ids = output_ids[:, prompt_len:]  # [B*num_gen, R]
             full_mask = torch.cat([attention_mask.repeat_interleave(num_generations, dim=0), attention_mask.new_ones(output_ids.size(0), completion_ids.size(1))], dim=1)
+            #每个生成 Token 的旧策略 Log Probability
             per_token_logps = compute_per_token_logps(self.policy_model, output_ids, completion_ids.size(1), attention_mask=full_mask)
+        #解码后的回答
         completions = self.tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
         return RolloutResult(output_ids, completion_ids, per_token_logps, completions,
                              prompt_ids.new_full((output_ids.size(0),), prompt_len),
@@ -96,6 +106,14 @@ class TorchRolloutEngine(RolloutEngine):
 
 
 # ===== SGLang HTTP API 推理引擎 =====
+#请求已经启动的sglang服务
+#    训练进程                         SGLang 服务进程                                           
+#        │                                  │                                                   
+#        │  HTTP POST /generate             │                                                   
+#        ├─────────────────────────────────►│                                                   
+#        │                                  │                                                   
+#        │  返回生成结果和 logprob            │                                                  
+#        ◄─────────────────────────────────-┤   
 class SGLangRolloutEngine(RolloutEngine):
     def __init__(self, base_url: str, model_path: str, shared_ckpt_path: str = "./sglang_ckpt", timeout: int = 120):
         self.base_url = base_url.rstrip('/')
@@ -110,13 +128,15 @@ class SGLangRolloutEngine(RolloutEngine):
         for ids, mask in zip(prompt_ids, attention_mask):
             valid_ids = ids[mask.bool()].tolist()
             input_ids_list.append(valid_ids)
+            #吧每个提示词重复num_generations遍
+            #外层循环遍历每一个ids，内层循环把每个ids复制num_generations遍
         all_input_ids = [ids for ids in input_ids_list for _ in range(num_generations)]
         
         payload = {
-            "input_ids": all_input_ids,
+            "input_ids": all_input_ids,#输出token
             "sampling_params": {
-                "temperature": temperature,
-                "max_new_tokens": max_new_tokens,
+                "temperature": temperature,#采样温度
+                "max_new_tokens": max_new_tokens,#最多生成多少token
                 "stop_token_ids": [self.tokenizer.eos_token_id] if self.tokenizer.eos_token_id else [],
             },
             "return_logprob": True,
@@ -138,12 +158,14 @@ class SGLangRolloutEngine(RolloutEngine):
             raw_logprobs = meta.get("output_token_logprobs", [])
             
             logprobs = []
+            #兼容不同sglang版本
             for item in raw_logprobs:
                 if isinstance(item, (list, tuple)) and len(item) >= 1:
                     logprobs.append(item[0])
                 elif isinstance(item, (int, float)):
                     logprobs.append(item)
             
+            #
             if len(logprobs) < len(completion_ids):
                 logprobs = [0.0] * (len(completion_ids) - len(logprobs)) + logprobs
             elif len(logprobs) > len(completion_ids):
@@ -159,6 +181,7 @@ class SGLangRolloutEngine(RolloutEngine):
         max_comp_len = max(1, max(len(ids) for ids in all_completion_ids))
         max_out_len = max(len(ids) for ids in all_input_ids) + max_comp_len
         
+        #把不同长度padding成tensor
         def pad_to_tensor(seqs, max_len, pad_val=0):
             return torch.tensor([s + [pad_val] * (max_len - len(s)) for s in seqs], device=device)
         
@@ -172,6 +195,17 @@ class SGLangRolloutEngine(RolloutEngine):
             completion_mask=torch.tensor([[1] * len(ids) + [0] * (max_comp_len - len(ids)) for ids in all_completion_ids], device=device),
         )
     
+
+#训练中的policy model会不断更新，但是sglang服务加载自己进程的模型， 
+# 所以要每隔一段时间，训练代码执行rollout_engine.update_policy(model) 
+#   训练进程中的最新 policy model                                                              
+#           │                                                                                  
+#           ├── 保存到共享目录 shared_ckpt_path                                                
+#           │                                                                                  
+#           └── POST /update_weights_from_disk                                                 
+#                       │                                                                      
+#                       ▼                                                                      
+#                SGLang 重新加载权重     
     def update_policy(self, model: torch.nn.Module):
         ok = True
         if not dist.is_initialized() or dist.get_rank() == 0:
@@ -179,9 +213,12 @@ class SGLangRolloutEngine(RolloutEngine):
                 unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
                 unwrapped = getattr(unwrapped, '_orig_mod', unwrapped)
                 abs_path = os.path.abspath(self.shared_ckpt_path)
+                #先把模型参数脱离计算图，转到CPU，转成FP16
                 state_dict = {k: v.detach().half().cpu() for k, v in unwrapped.state_dict().items()}
+                #保存模型和 tokenizer
                 unwrapped.save_pretrained(abs_path, state_dict=state_dict, safe_serialization=False)
                 self.tokenizer.save_pretrained(abs_path)
+                #请求SGLang
                 resp = self.http.post(f"{self.base_url}/update_weights_from_disk", json={"model_path": abs_path}, timeout=self.timeout)
                 if resp.status_code != 200: print(f"[SGLANG WARNING] update_weights 失败: {resp.status_code}, {resp.text}")
                 ok = resp.status_code == 200

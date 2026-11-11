@@ -21,18 +21,25 @@ from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint
 
 warnings.filterwarnings('ignore')
 
-
+# batchmean 表示对所有样本的 KL 求和，再除以样本数量 N。
 def distillation_loss(student_logits, teacher_logits, temperature=1.0, reduction='batchmean'):
     with torch.no_grad():
+        # 计算 Teacher 概率分布 
+        # teacher_logits:[N,V]  N 是参与蒸馏的 Token 数量，V 是词表大小
         teacher_probs = F.softmax(teacher_logits / temperature, dim=-1).detach()
 
     student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
 
+# 基于两个完整概率分布计算 KL 
+# F.kl_div 要求第一个参数是对数概率，第二个参数是概率分布
+#KL=sum_i teacher_probs_i(log teacher_probs_i - student_log_probs_i)
     kl = F.kl_div(
         student_log_probs,
         teacher_probs,
         reduction=reduction
     )
+#     提高 Temperature 会使 Softmax 分布变平缓，同时也会改变梯度的量级。
+# 乘以 \(T^2\) 是经典知识蒸馏中的梯度尺度补偿，使不同温度下的蒸馏损失具有更合理的尺度。
     return (temperature ** 2) * kl
 
 
@@ -66,9 +73,14 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
                 teacher_logits = teacher_logits[..., :vocab_size_student]
 
         # ========== 计算损失 ==========
-        # 1) Ground-Truth CE Loss
+        # 1) Ground-Truth CE Loss  基于数据集提供的真实答案计算交叉熵损失。
+        #CE 交叉熵损失
+        #将 labels 向左移动一个位置，得到预测目标
         shift_labels = labels[..., 1:].contiguous()
         loss_mask_flat = loss_mask.view(-1)
+        # student_logits：Student 模型输出的预测分数，最后一维是词表大小 V。
+        # view(-1, V)：将 Batch 和 Sequence 两个维度合并，变成 [B×(T-1), V]（前提是 logits 已经与移位后的 labels 对齐）。
+        # shift_labels.view(-1)：将目标 Token 展平，变成 [B×(T-1)]。
         ce_loss = F.cross_entropy(
             student_logits.view(-1, student_logits.size(-1)),
             shift_labels.view(-1),
@@ -79,7 +91,7 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
         if lm_config_student.use_moe: ce_loss = ce_loss_raw + res.aux_loss
         else: ce_loss = ce_loss_raw
 
-        # 2) Distillation Loss
+        # 2) Distillation Loss Student 学习 Teacher 的预测分布
         if teacher_model is not None:
             distill_loss = distillation_loss(
                 student_logits.view(-1, student_logits.size(-1))[loss_mask_flat == 1],
@@ -90,6 +102,7 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
             distill_loss = torch.tensor(0.0, device=args.device)
 
         # 3) 总损失 = alpha * CE + (1-alpha) * Distill
+        #默认alpha=0.5 T=1.5
         loss = (alpha * ce_loss + (1 - alpha) * distill_loss) / args.accumulation_steps
 
         scaler.scale(loss).backward()
@@ -205,6 +218,9 @@ if __name__ == "__main__":
     model, tokenizer = init_model(lm_config_student, args.from_student_weight, device=args.device)
     Logger(f'学生模型总参数量：{sum(p.numel() for p in model.parameters()) / 1e6:.3f} M')
     teacher_model, _ = init_model(lm_config_teacher, args.from_teacher_weight, device=args.device)
+    # Teacher 负责产生监督信号。
+    # Student 负责学习。
+    # Teacher 不参与参数更新。
     teacher_model.eval()
     teacher_model.requires_grad_(False)
     Logger(f'教师模型总参数量：{sum(p.numel() for p in teacher_model.parameters()) / 1e6:.3f} M')

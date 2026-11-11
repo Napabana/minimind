@@ -11,7 +11,7 @@ class LoRA(nn.Module):
         self.B = nn.Linear(rank, out_features, bias=False)  # 低秩矩阵B
         # 矩阵A高斯初始化
         self.A.weight.data.normal_(mean=0.0, std=0.02)
-        # 矩阵B全0初始化
+        # 矩阵B全0初始化 刚注入LORA时模型输出就和原始模型完全一致
         self.B.weight.data.zero_()
 
     def forward(self, x):
@@ -20,12 +20,13 @@ class LoRA(nn.Module):
 
 def apply_lora(model, rank=16):
     for name, module in model.named_modules():
+        #只对输入和输出维度相等的linear层注入LoRA
         if isinstance(module, nn.Linear) and module.in_features == module.out_features:
             lora = LoRA(module.in_features, module.out_features, rank=rank).to(model.device)
             setattr(module, "lora", lora)
             original_forward = module.forward
 
-            # 显式绑定
+            # 显式绑定 替换为线性层+LoRA
             def forward_with_lora(x, layer1=original_forward, layer2=lora):
                 return layer1(x) + layer2(x)
 

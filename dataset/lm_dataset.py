@@ -142,6 +142,8 @@ class DPODataset(Dataset):
         sample = self.samples[index]
         chosen = sample['chosen']  # 是一个 list，里面包含若干 {role, content}
         rejected = sample['rejected']  # 同上
+        # tokenize=False：先得到格式化的文本，不立即转换 Token ID。
+        # add_generation_prompt=False：因为数据中已经包含完整的 Assistant 回答，不需要额外添加待生成的 Assistant 前缀。
         chosen_prompt = self.tokenizer.apply_chat_template(
             chosen, tokenize=False, add_generation_prompt=False
         )
@@ -159,13 +161,19 @@ class DPODataset(Dataset):
         )
 
         chosen_input_ids = chosen_encoding['input_ids']
+        # 只计算 Assistant 生成部分的概率。忽略提问只看问答
         chosen_loss_mask = self.generate_loss_mask(chosen_input_ids)
 
         rejected_input_ids = rejected_encoding['input_ids']
         rejected_loss_mask = self.generate_loss_mask(rejected_input_ids)
+        # 使用自回归语言模型的 Next Token Prediction。
+        #x_chosen 获取除了最后一个元素之外的所有元素。
+        #y_chosen 获取除了第一个元素之外的所有元素。
+        # mask_chosen 掩码跟着后移
         x_chosen = torch.tensor(chosen_input_ids[:-1], dtype=torch.long)
         y_chosen = torch.tensor(chosen_input_ids[1:], dtype=torch.long)
         mask_chosen = torch.tensor(chosen_loss_mask[1:], dtype=torch.long)
+        
         x_rejected = torch.tensor(rejected_input_ids[:-1], dtype=torch.long)
         y_rejected = torch.tensor(rejected_input_ids[1:], dtype=torch.long)
         mask_rejected = torch.tensor(rejected_loss_mask[1:], dtype=torch.long)
@@ -179,25 +187,63 @@ class DPODataset(Dataset):
             'mask_rejected': mask_rejected
         }
 
+    # 找到 Assistant 消息的起始位置。
+    # 找到 Assistant 消息结束位置。
+    # 将 Assistant 正文和结束标记对应的位置设为 1。
     def generate_loss_mask(self, input_ids):
+        # 初始化 Loss Mask，长度与 input_ids 相同。
+        # 默认全部为 0，表示暂时不参与 Loss 计算。
         loss_mask = [0] * len(input_ids)
+        # i：当前扫描到的 Token 位置。
         i = 0
+
+        # 从头到尾扫描整个 Token 序列。
         while i < len(input_ids):
+            # 判断当前位置开始的 Token 序列，
+            # 是否与 Assistant 消息起始标记 bos_id 完全一致。
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
+
+                # 找到 Assistant 消息起始标记。
+                # start 指向 Assistant 正文的第一个 Token。
+                # 不包含 bos_id 本身。
                 start = i + len(self.bos_id)
+
+                # end 从正文起始位置开始，
+                # 用于向后搜索 Assistant 消息的结束标记。
                 end = start
+                
+                # 在当前 Assistant 消息内部向后扫描。
                 while end < len(input_ids):
+
+                    # 判断当前位置开始的 Token 序列，
+                    # 是否与 Assistant 消息结束标记 eos_id 完全一致。
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
+                        # 找到结束标记，停止搜索。
                         break
+
+                    # 尚未找到结束标记，继续向后移动一个 Token。
                     end += 1
+
+                # 将 Assistant 正文和结束标记对应的位置设为 1。
+                # end 是结束标记的起始位置，因此需要加上 eos_id 长度。
+                # min 用于限制标记范围不超过 max_length。
                 for j in range(start, min(end + len(self.eos_id), self.max_length)):
                     loss_mask[j] = 1
+
+                # 当前 Assistant 消息处理完毕。
+                # 跳过结束标记，继续扫描后面的消息。
+                # 如果没有找到结束标记，则直接结束整个扫描。
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
+
             else:
+                # 当前 Token 不是 Assistant 消息的起始标记，
+                # 继续向后移动一个 Token。
                 i += 1
+
+        # 返回生成的 Loss Mask。
         return loss_mask
 
-
+#产出干净的，待模型作答的问题文本
 class RLAIFDataset(Dataset):
     def __init__(self, jsonl_path, tokenizer, max_length=1024, thinking_ratio=0.5):
         super().__init__()
@@ -212,18 +258,24 @@ class RLAIFDataset(Dataset):
         return len(self.samples)
 
     def create_chat_prompt(self, conversations):
+        #清洗/格式化  原始对话数据，变成标准的 chat 格式（如 [{"role": "user", "content": ...}, {"role": "assistant",   "content": ...}]）。           
         conversations = pre_processing_chat(conversations)
         use_thinking = random.random() < self.thinking_ratio
         return self.tokenizer.apply_chat_template(
+            #读取的是已有对话的前缀
+            #关键一步。原始对话最后一条是 assistant 的回答，切掉它，只保留"问题前缀"。因为 GRPO 不需要现成答案——答案要模型自己生成再打分。
             conversations[:-1],
+            #GRPO训练是 提示词(字符串)+模型生成的answer(字符串) 拼接后再tokenize: 所以这里保留了字符串是可拼接可复制的
             tokenize=False,
             open_thinking=use_thinking,
+            #add_generation_prompt=True 会在末尾补上assistant 的开头标记，这样拼出来的 prompt 可以直 接送进模型续写回答。
             add_generation_prompt=True
         )
     def __getitem__(self, index):
         sample = self.samples[index]
         prompt = self.create_chat_prompt(sample['conversations'])
 
+        #answer为空，模型会根据提示词在线生成回答，再由reward model评分
         return {
             'prompt': prompt,
             'answer': ""
@@ -248,10 +300,13 @@ class AgentRLDataset(Dataset):
         for message in conversations:
             message = dict(message)
             if message.get("role") == "system" and message.get("tools"):
+                # 如果 `tools` 是字符串，就先通过 `json.loads()` 转换成 Python 对象。
                 tools = json.loads(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
             messages.append(message)
+            # 移除 conversations 的最后一条消息
         return messages[:-1], tools
 
+    #返回 初始对话上下文，可调用工具的定义，和Groudtruth(标准答案)
     def __getitem__(self, index):
         sample = self.samples[index]
         messages, tools = self.parse_conversations(sample['conversations'])

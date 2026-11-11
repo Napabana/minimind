@@ -21,23 +21,38 @@ from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint
 
 warnings.filterwarnings('ignore')
 
-
+#对于 Batch 中的每条样本，在每个 Token 位置上，只保留模型对真实目标 Token 的预测 log probability。
 def logits_to_log_probs(logits, labels):
     # logits shape: (batch_size, seq_len, vocab_size)
+    #每条样本有 1023 个 Token 位置，每个位置都有 6400 个候选 Token 的预测分数。
+
     # labels shape: (batch_size, seq_len)
+
     # log_probs shape: (batch_size, seq_len)
+    #沿着词表维度进行 Softmax，再取对数：[8,1023,6400]
+    #得到了全部候选 Token 的 log probability
     log_probs = F.log_softmax(logits, dim=2)
+
+    #labels增加一个维度变成[8，1023，1]:torch.gather() 要求 index 张量和输入张量具有相同的维度数量。
+    # #然后沿词表维度取出实际标签对应的log probability 
+        #index：告诉它每个位置应该取第几个 Token。
+    #然后再squeeze(-1)得到[8，1023] 只返回真实标签对应的log probability
+    #log\_probs\_per\_token[b,t]=\log P(labels[b,t]\mid logits[b,t])
     log_probs_per_token = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1)
     return log_probs_per_token
 
 
 def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     # ref_log_probs 和 policy_log_probs 都是 shape: (batch_size, seq_len)
+    #乘以 Mask：
+    #logP(y|x)=sum(1-T) mask_t * logP(y_t|x,y<t)
+    #使用的是 Token Log Probability 求和，而不是求平均。计算的是整个 Assistant 回答的序列对数概率。
     ref_log_probs = (ref_log_probs * mask).sum(dim=1)
     policy_log_probs = (policy_log_probs * mask).sum(dim=1)
 
     # 将 chosen 和 rejected 数据分开
     batch_size = ref_log_probs.shape[0]
+    #这里看train_epoch() 前一半是chosen，后一半是rejected
     chosen_ref_log_probs = ref_log_probs[:batch_size // 2]
     reject_ref_log_probs = ref_log_probs[batch_size // 2:]
     chosen_policy_log_probs = policy_log_probs[:batch_size // 2]
@@ -71,6 +86,7 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             param_group['lr'] = lr
 
         with autocast_ctx:
+            #使用 torch.no_grad()，因为 Reference Model 不需要更新参数
             with torch.no_grad():
                 ref_outputs = ref_model(x)
                 ref_logits = ref_outputs.logits
@@ -81,7 +97,9 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             policy_log_probs = logits_to_log_probs(logits, y)
             
             dpo_loss_val = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=beta)
+            #outputs.aux_loss：MoE 架构使用的辅助损失；非 MoE 架构下不需要承担实际的 MoE 负载均衡训练。
             loss = dpo_loss_val + outputs.aux_loss
+            #accumulation_steps梯度累积
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
